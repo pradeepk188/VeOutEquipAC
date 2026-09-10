@@ -1,0 +1,58 @@
+#!/bin/bash
+#
+# Setup script for the OutEquipAc package (Venus OS / SetupHelper /
+# PackageManager). Installs the BLE bridge as a service; there are no
+# system files to replace, so this only drives INSTALL_SERVICE.
+#
+# The one thing this package needs beyond what SetupHelper's list-based
+# install handles is the AC's BLE MAC address, so this script does its own
+# prompting rather than setting standardPromptAndActions='yes'.
+
+#### following line incorporates helper resources into this script
+source "/data/SetupHelper/HelperResources/IncludeHelpers"
+#### end of lines to include helper resources
+
+# CommonResources hands control back here with $scriptAction set to
+# NONE (interactive, need to prompt), INSTALL, or UNINSTALL.
+
+packageDir="$scriptDir"
+macConfigFile="$packageDir/mac.conf"
+
+if [ "$scriptAction" == 'NONE' ]; then
+    echo
+    echo "OutEquipAc -- BLE bridge for an OutEquipPro rooftop AC unit"
+    echo "See NOTES.md before relying on this: the BLE characteristic UUIDs"
+    echo "and register map are inferred from Velit-branded units on the same"
+    echo "platform, not yet confirmed by direct capture against an"
+    echo "OutEquip-branded module."
+    echo
+
+    standardActionPrompt
+    # standardActionPrompt sets $scriptAction to INSTALL, UNINSTALL, or exits
+    # the script outright (quit). It does not return with scriptAction=NONE.
+
+    if [ "$scriptAction" == 'INSTALL' ]; then
+        currentMac=""
+        [ -f "$macConfigFile" ] && currentMac=$(cat "$macConfigFile")
+        read -r -p "BLE MAC address of the AC's KT module [$currentMac]: " macAddress
+        macAddress=${macAddress:-$currentMac}
+        if [ -z "$macAddress" ]; then
+            echo "No MAC address given -- can't install without one."
+            installFailed=true
+        else
+            echo "$macAddress" > "$macConfigFile"
+        fi
+    fi
+fi
+
+# Re-test scriptAction: a failed install above must fall through to
+# UNINSTALL rather than leave a half-configured service behind.
+if [ "$installFailed" == true ]; then
+    scriptAction='UNINSTALL'
+fi
+
+if [ "$scriptAction" == 'UNINSTALL' ]; then
+    rm -f "$macConfigFile"
+fi
+
+endScript INSTALL_SERVICE

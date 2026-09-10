@@ -1,0 +1,16 @@
+#!/bin/bash
+# Installed by SetupHelper as /service/OutEquipAc (or
+# /opt/victronenergy/service/OutEquipAc on v2.80+).
+# Package directory persists across Venus OS updates, so config lives there
+# too rather than in a system path that might get wiped.
+exec 2>&1
+cd /data/dbus-outequipac || exit 1
+
+if [ ! -f ./mac.conf ]; then
+    echo "OutEquipAc: mac.conf missing -- run the package setup script again"
+    sleep 30
+    exit 1
+fi
+macAddress=$(cat ./mac.conf)
+
+exec python3 outequipac.py --mac "$macAddress" --device-instance "${OUTEQUIPAC_DEVICE_INSTANCE:-100}"
