@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-dbus-outequipac: Venus OS driver bridging an OutEquipPro AC's built-in BLE
+VeOutEquipAC: Venus OS driver bridging an OutEquipPro AC's built-in BLE
 module onto the D-Bus (and from there, onto Venus's local/VRM MQTT bridge,
 Node-RED, and the GX device list).
 
 Modeled after the existing Venus driver conventions used by
 dbus-serialbattery / dbus-btbattery (velib_python's VeDbusService, a
-runit `service/run` wrapper, poll-and-publish loop) so it fits the same
+poll-and-publish loop), packaged via kwindrem/SetupHelper's
+`services/<name>/run` convention so it fits the same
 install/update/troubleshoot workflow already in place on this Pi.
 
 Because there's no first-class Victron device class for "rooftop AC",
@@ -31,6 +32,7 @@ import argparse
 import logging
 import os
 import sys
+import threading
 import time
 from typing import Optional
 
@@ -40,9 +42,9 @@ sys.path.insert(
 from vedbus import VeDbusService  # noqa: E402  (Venus OS provided library)
 
 import ac_protocol as proto  # noqa: E402
-from ble_client import AcBleClient  # noqa: E402
+from ble_client import AcBleClient, RESPONSE_TIMEOUT_S  # noqa: E402
 
-logger = logging.getLogger("dbus-outequipac")
+logger = logging.getLogger("VeOutEquipAC")
 
 POLL_INTERVAL_S = 6.0  # matches the stock app's ~6s cycle
 RECONNECT_BACKOFF_S = 5.0
@@ -55,6 +57,8 @@ class OutEquipAcDriver:
         self._ble = AcBleClient(mac_address, on_frame_bytes=self._on_bytes)
         self._service = self._build_service(device_instance)
         self._last_poll_index = 0
+        self._active_handshake_event = threading.Event()
+        self._active_handshake_value: Optional[int] = None
 
     # -- D-Bus service setup -------------------------------------------------
 
@@ -111,6 +115,7 @@ class OutEquipAcDriver:
         while True:
             try:
                 self._ble.connect()
+                self._do_active_handshake()
                 self._service["/Connected"] = 1
                 self._run_poll_loop()
             except Exception:  # noqa: BLE001 - top-level supervisor loop
@@ -118,6 +123,32 @@ class OutEquipAcDriver:
                 self._service["/Connected"] = 0
                 self._ble.disconnect()
                 time.sleep(RECONNECT_BACKOFF_S)
+
+    def _do_active_handshake(self) -> None:
+        """
+        Per protocol.md's Initialization section: query key 66 (Active)
+        immediately on connect, and if the reply is 2, write 1 back,
+        before querying anything else. Confirmed necessary against real
+        hardware via dev-tools/ble_scan_test.py and the ESP32 test sketch
+        -- without this, the module does not answer other queries either.
+        """
+        self._active_handshake_event.clear()
+        self._active_handshake_value = None
+        logger.info("Sending Active (66) handshake query")
+        self._ble.send(proto.make_query(proto.REG_ACTIVE))
+        deadline = time.monotonic() + RESPONSE_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if self._ble.wait_for_notifications(0.5):
+                if self._active_handshake_event.is_set():
+                    break
+        if not self._active_handshake_event.is_set():
+            logger.warning("No reply to Active handshake within timeout; proceeding anyway")
+            return
+        logger.info("Active handshake replied with value=%s", self._active_handshake_value)
+        if self._active_handshake_value == 2:
+            logger.info("Active==2, writing Active=1 per protocol.md")
+            self._ble.send(proto.make_write(proto.REG_ACTIVE, 1))
+            time.sleep(0.5)
 
     def _run_poll_loop(self) -> None:
         registers = proto.DEFAULT_POLL_REGISTERS
@@ -127,9 +158,7 @@ class OutEquipAcDriver:
             self._ble.send(proto.make_query(reg))
             # Pump notifications until either a frame arrives or we time out;
             # the protocol guarantees at most one outstanding command.
-            deadline = time.monotonic() + proto.RESPONSE_TIMEOUT_S if hasattr(
-                proto, "RESPONSE_TIMEOUT_S"
-            ) else time.monotonic() + 3.0
+            deadline = time.monotonic() + RESPONSE_TIMEOUT_S
             while time.monotonic() < deadline:
                 if self._ble.wait_for_notifications(0.5):
                     break
@@ -153,7 +182,10 @@ class OutEquipAcDriver:
     def _apply_frame(self, frame: proto.Frame) -> None:
         reg, val = frame.register, frame.value
         with self._service as s:
-            if reg == proto.REG_POWER:
+            if reg == proto.REG_ACTIVE:
+                self._active_handshake_value = val
+                self._active_handshake_event.set()
+            elif reg == proto.REG_POWER:
                 s["/SwitchableOutput/output_1/State"] = 1 if val == proto.ON_OFF_ON else 0
                 s["/SwitchableOutput/output_1/Status"] = 1 if val == proto.ON_OFF_ON else 0
             elif reg == proto.REG_MODE:

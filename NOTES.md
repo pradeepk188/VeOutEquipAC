@@ -21,7 +21,28 @@ circumstantial evidence" is exactly the kind of thing to verify with your
 actual hardware before trusting it for automation (especially the write
 paths -- turning your AC on/off/heat unattended).
 
-## Before relying on this
+## Confirmed against real hardware
+
+- **GATT layout confirmed** (2026-09) against a real unit, name
+  `KT2026050001550`, MAC `E6:87:25:EC:B3:84`, via `dev-tools/ble_scan_test.py
+  dump`: service `FFE0`, notify `FFE1`, write `FFE2` all present with the
+  expected properties. `ble_client.py`'s `SERVICE_UUID`/`NOTIFY_CHAR_UUID`/
+  `WRITE_CHAR_UUID` constants need no changes.
+- Register-level frame decoding (point 3 below) still needs the same
+  `query` command run and its output compared against expectations.
+- **Initialization handshake required.** Re-reading `protocol.md`'s
+  Initialization section directly (rather than from memory) turned up a
+  step neither `ble_client.py` nor the original `ble_scan_test.py` did: the
+  real app queries key `66` (Active) immediately on connect and, if the
+  reply is `2`, writes `1` back, *before* querying anything else. It also
+  never queries key `1` (Power) directly at all -- only `2, 3, 7, 8, 18, 19`
+  after that handshake. `dev-tools/ble_scan_test.py query` now does this
+  handshake automatically before sending the requested query.
+  `outequipac.py`'s poll loop does not yet do this handshake -- needs
+  adding once `query` confirms it's actually necessary for responses (vs.
+  just app bookkeeping) against this unit.
+
+## Before relying on this (remaining items)
 
 1. **Confirm the GATT layout on your unit.** From the Pi:
    ```
@@ -92,7 +113,7 @@ PackageManager, instead of a hand-rolled runit drop-in.
   beyond SetupHelper's automatic file/service handling), and calls
   `endScript INSTALL_SERVICE`.
 - The MAC address is stored in `mac.conf` inside the package's own
-  directory (`/data/dbus-outequipac/mac.conf`) rather than through
+  directory (`/data/VeOutEquipAC/mac.conf`) rather than through
   SetupHelper's `$setupOptionsDir` mechanism -- simpler, and the package
   directory itself already survives firmware updates and reinstalls the
   same way `$setupOptionsDir` would.

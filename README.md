@@ -48,6 +48,51 @@ the service and removes `mac.conf`.
 | `NOTES.md` | Protocol confidence, open questions, verification steps, packaging notes |
 
 
+# dev-tools
+
+Local test scripts for validating assumptions against real hardware.
+**Not part of the Venus OS package** -- SetupHelper doesn't install this
+directory; it never ships to the Pi.
+
+## ble_scan_test.py
+
+Windows-side BLE probe using `bleak` (cross-platform: Windows/macOS/Linux),
+as opposed to `ble_client.py`'s `bluepy` (Linux/BlueZ only -- what actually
+runs on the Pi). Confirms whether `ac_protocol.py`'s frame codec and
+`ble_client.py`'s assumed service/characteristic UUIDs (FFE0/FFE1/FFE2)
+match your actual OutEquipPro unit, before trusting either on the Pi.
+
+### Setup
+
+```
+pip install bleak
+```
+
+### Usage
+
+```
+# 1. Find the AC's BLE address. Look for a name starting with KT, or
+#    containing OutEquip/Velit.
+python ble_scan_test.py scan
+
+# 2. Confirm the GATT layout (service/characteristic UUIDs) matches what
+#    ble_client.py assumes.
+python ble_scan_test.py dump <ADDRESS>
+
+# 3. Send one read-only query frame for a register, decoded through the
+#    real ac_protocol.py codec.
+python ble_scan_test.py query <ADDRESS> --register power
+```
+
+`query` only ever sends read frames (value=0) -- it can't change the AC's
+actual state, so it's safe to run before you trust anything else here.
+
+If `dump` shows different UUIDs than expected, update
+`ble_client.py`'s `SERVICE_UUID` / `NOTIFY_CHAR_UUID` / `WRITE_CHAR_UUID`
+constants to match before doing anything else with this project.
+
+
+
 ## Refs
 
 - https://github.com/bobbaboui/outequip-ha
