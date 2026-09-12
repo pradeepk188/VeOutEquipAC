@@ -34,11 +34,21 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
-sys.path.insert(
-    0, os.path.join(os.path.dirname(__file__), "ext", "velib_python")
-)
+sys.path.insert(0, str(Path(__file__).resolve().parent / "ext" / "velib_python"))
+
+# Must happen before any D-Bus connection is created (vedbus creates one on
+# import-time construction of VeDbusService below) -- python-dbus requires
+# a main loop registered up front even for a driver like this one that
+# never actually calls mainloop.run() itself, since the polling loop below
+# provides its own scheduling via time.sleep(). Every other Venus OS driver
+# using velib_python does this; missing it fails with:
+#   RuntimeError: ...D-Bus connections must be attached to a main loop...
+from dbus.mainloop.glib import DBusGMainLoop  # noqa: E402
+DBusGMainLoop(set_as_default=True)
+
 from vedbus import VeDbusService  # noqa: E402  (Venus OS provided library)
 
 import ac_protocol as proto  # noqa: E402

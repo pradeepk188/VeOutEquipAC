@@ -114,6 +114,18 @@ paths -- turning your AC on/off/heat unattended).
   Confirmed against SetupHelper's real source, not documentation/memory --
   worth doing this for anything else `setup` calls before trusting it
   again.
+- **Missing D-Bus main loop registration, found running directly on the
+  Pi.** `outequipac.py` crashed immediately with `RuntimeError: ...D-Bus
+  connections must be attached to a main loop...` the moment it tried to
+  construct `VeDbusService`. python-dbus requires `DBusGMainLoop` to be
+  registered as the default main loop *before* any D-Bus connection is
+  made -- every other Venus OS driver using `velib_python` does this at
+  startup; this one simply never did. Fixed: `from dbus.mainloop.glib
+  import DBusGMainLoop; DBusGMainLoop(set_as_default=True)` now runs
+  before `vedbus` is imported. Note this doesn't require ever calling
+  `mainloop.run()` -- the driver's own polling loop with `time.sleep()`
+  provides its own scheduling; the main loop object just needs to exist
+  to satisfy python-dbus's requirement.
 
 ## Before relying on this (remaining items)
 
