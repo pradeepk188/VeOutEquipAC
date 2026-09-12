@@ -126,6 +126,14 @@ paths -- turning your AC on/off/heat unattended).
   `mainloop.run()` -- the driver's own polling loop with `time.sleep()`
   provides its own scheduling; the main loop object just needs to exist
   to satisfy python-dbus's requirement.
+- **`ext/velib_python` symlink now created automatically by `setup`, not
+  a manual step.** The manual `ln -s` done earlier during testing didn't
+  survive a reinstall -- PackageManager re-extracts the package tarball
+  fresh each time, which wipes any file not tracked in the git repo,
+  symlinks included. `setup` now creates it itself on every `INSTALL`
+  action (pointing at `/opt/victronenergy/dbus-systemcalc-py/ext/velib_python`),
+  so it gets recreated every single install, scripted or automatic,
+  rather than depending on someone remembering to redo it by hand.
 
 ## Before relying on this (remaining items)
 

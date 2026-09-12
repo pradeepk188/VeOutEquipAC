@@ -32,7 +32,13 @@ if [ "$scriptAction" == 'NONE' ]; then
     # the script outright (quit). It does not return with scriptAction=NONE.
 
     if [ "$scriptAction" == 'INSTALL' ]; then
-        currentMac=""
+        # TESTING-PHASE DEFAULT ONLY: pre-fills this specific unit's MAC so
+        # repeated reinstalls during development don't require retyping it.
+        # Remove this hardcoded default before treating this as a general
+        # release -- every other OutEquipPro owner's unit has a different
+        # MAC, and shipping this device's address in a public repo is not
+        # appropriate past the testing phase.
+        currentMac="E6:87:25:EC:B3:84"
         [ -f "$macConfigFile" ] && currentMac=$(cat "$macConfigFile")
         read -r -p "BLE MAC address of the AC's KT module [$currentMac]: " macAddress
         macAddress=${macAddress:-$currentMac}
@@ -49,6 +55,23 @@ fi
 # UNINSTALL rather than leave a half-configured service behind.
 if [ "$installFailed" == true ]; then
     scriptAction='UNINSTALL'
+fi
+
+if [ "$scriptAction" == 'INSTALL' ] && ! $installFailed; then
+    # outequipac.py needs velib_python (for vedbus) at ./ext/velib_python.
+    # A plain manual `ln -s` doesn't survive a reinstall -- PackageManager
+    # re-extracts the package tarball fresh each time, wiping any file not
+    # tracked in the repo, including a symlink someone created by hand.
+    # Doing it here means it gets recreated on every single install,
+    # scripted or automatic, not just the first time.
+    velibSource="/opt/victronenergy/dbus-systemcalc-py/ext/velib_python"
+    if [ -d "$velibSource" ]; then
+        mkdir -p "$packageDir/ext"
+        ln -sfn "$velibSource" "$packageDir/ext/velib_python"
+        logMessage "linked velib_python from $velibSource"
+    else
+        logMessage "WARNING: $velibSource not found -- outequipac.py will fail to import vedbus"
+    fi
 fi
 
 if [ "$scriptAction" == 'UNINSTALL' ]; then
