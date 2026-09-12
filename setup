@@ -2,7 +2,7 @@
 #
 # Setup script for the OutEquipAc package (Venus OS / SetupHelper /
 # PackageManager). Installs the BLE bridge as a service; there are no
-# system files to replace, so this only drives INSTALL_SERVICE.
+# system files to replace, so this only drives INSTALL_SERVICES.
 #
 # The one thing this package needs beyond what SetupHelper's list-based
 # install handles is the AC's BLE MAC address, so this script does its own
@@ -55,4 +55,4 @@ if [ "$scriptAction" == 'UNINSTALL' ]; then
     rm -f "$macConfigFile"
 fi
 
-endScript INSTALL_SERVICE
+endScript INSTALL_SERVICES

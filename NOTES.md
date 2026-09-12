@@ -30,6 +30,46 @@ paths -- turning your AC on/off/heat unattended).
   `WRITE_CHAR_UUID` constants need no changes.
 - Register-level frame decoding (point 3 below) still needs the same
   `query` command run and its output compared against expectations.
+- **Real app's connection stayed stable through a power toggle.** An ADB
+  `logcat` capture (not an HCI snoop -- no characteristic payload bytes,
+  only high-level GATT lifecycle calls) of the app connecting, toggling
+  the AC on then off, and disconnecting showed the module holding one
+  continuous connection the whole time: connect -> discoverServices ->
+  MTU negotiated to 517 -> subscribe Service Changed (`2A05`) -> connection
+  parameters updated (45ms interval / 5s supervision timeout) -> subscribe
+  `FFE1`. No disconnect logged anywhere in that ~30s window. This is
+  evidence *against* "the module is just flaky" as the root cause of the
+  Windows-side instant-disconnect symptom -- something specific to that
+  bleak/Windows session is the more likely explanation.
+  `dev-tools/ble_scan_test.py` now subscribes to `2A05` before `FFE1` too,
+  best-effort, mirroring the one concrete sequence difference this
+  capture revealed. Unconfirmed whether the module's firmware actually
+  needs it or the app just does it as generic Android BLE hygiene.
+  Getting the actual write/notify *payload bytes* still needs an HCI
+  snoop log (Developer Options -> Enable Bluetooth HCI snoop log -> pull
+  `btsnoop_hci.log` -> open in Wireshark), not a plain `adb logcat`.
+- **Register map and quirks independently confirmed.** Re-checked
+  `bobbaboui/outequip-ha`'s README/PROTOCOL.md directly (not from memory):
+  power `1=Off/2=On`, the cooling-before-power-off workaround, Light
+  register being write-only-in-practice, and the undocumented voltage/
+  current endianness (their code tries big-endian first, falls back to
+  little-endian only if implausible) all match what's already implemented
+  here. Nothing found there that requires a code change.
+- **Direct-host BLE against this module family is known to be flaky --
+  not just on Windows.** That same README explains the author didn't use
+  their host machine's (an Intel N100 mini PC) onboard Bluetooth adapter
+  directly at all: it was "too flaky" against this device, so they run a
+  dedicated ESP32-S3 as a pure Bluetooth proxy instead and disabled the
+  onboard adapter entirely, citing Home Assistant's own guidance that
+  overall reliability is limited to the worst-performing adapter in use.
+  That's a Linux/BlueZ host, not Windows/WinRT, having similar
+  connection-reliability problems with this chip family -- consistent
+  with (though not proof of) what we saw testing from Windows. If the
+  Raspberry Pi's onboard Bluetooth turns out to be similarly flaky once
+  tested directly, an ESP32-S3 running ESPHome's stock Bluetooth-proxy
+  firmware (no AC-specific code needed on the ESP32 itself) as a relay
+  between the AC and the Pi is a proven fallback architecture, not a
+  hypothetical one -- see `bobbaboui/outequip-ha`'s `proxy.yaml`.
 - **Initialization handshake required.** Re-reading `protocol.md`'s
   Initialization section directly (rather than from memory) turned up a
   step neither `ble_client.py` nor the original `ble_scan_test.py` did: the
@@ -41,6 +81,39 @@ paths -- turning your AC on/off/heat unattended).
   `outequipac.py`'s poll loop does not yet do this handshake -- needs
   adding once `query` confirms it's actually necessary for responses (vs.
   just app bookkeeping) against this unit.
+  **Update:** now implemented in `outequipac.py` (`_do_active_handshake`,
+  called right after `connect()` and before the poll loop starts). While
+  fixing this, also found and fixed the same `proto.RESPONSE_TIMEOUT_S`
+  mistake here that was in the original `ble_scan_test.py` -- that
+  constant lives in `ble_client.py`, not `ac_protocol.py`; the old code's
+  `hasattr` check silently masked it by falling back to a hardcoded 3.0s,
+  which happened to work but was dead, confusing code. Now imports and
+  uses the real constant directly.
+- **Executable bit lost in transit, confirmed on the Pi.** PackageManager's
+  log showed `ERROR:setup file for VeOutEquipAC not executable` --
+  `setup` (and the `services/OutEquipAc/run`/`log/run` scripts) lost their
+  Unix executable bit somewhere in the Windows-checkout -> GitHub ->
+  `git clone` on the Pi round-trip. This silently broke the install: the
+  interactive MAC-address prompt never ran (so `mac.conf` never got
+  created), and the service was never registered under `/service/` or
+  `/opt/victronenergy/service/` despite the source `services/OutEquipAc/`
+  folder existing under `/data/VeOutEquipAC/`. Fixed on-device with
+  `chmod +x`; see README.md for the permanent `git update-index --chmod=+x`
+  fix so future clones don't lose it again.
+- **`endScript` keyword typo, found by reading the real installed source on
+  the Pi.** `setup` called `endScript INSTALL_SERVICE` (singular) but
+  `endScript`'s actual `case` statement (in
+  `/data/SetupHelper/HelperResources/CommonResources`) only matches
+  `INSTALL_SERVICES` (plural) -- a non-matching case falls through silently,
+  so the script reported "complete - no errors" while never actually
+  calling `installAllServices`/`installService` at all. This is why
+  `mac.conf` got written correctly (that's our own code, ran fine) but the
+  service was never registered under `/service/` or
+  `/opt/victronenergy/service/` despite the source `services/OutEquipAc/`
+  folder existing. Fixed: `setup` now calls `endScript INSTALL_SERVICES`.
+  Confirmed against SetupHelper's real source, not documentation/memory --
+  worth doing this for anything else `setup` calls before trusting it
+  again.
 
 ## Before relying on this (remaining items)
 
