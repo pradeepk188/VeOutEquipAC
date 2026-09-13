@@ -302,6 +302,25 @@ paths -- turning your AC on/off/heat unattended).
       (never-before-paired) connection specifically, which this phone's
       session wasn't -- but flagging the discrepancy rather than treating
       the handshake as confirmed-necessary.
+  13b. **A second, independent copy of the same length-byte bug was found
+      in `try_decode()` (2026-09-13), after the fix above -- this one
+      matters more for live operation.** `try_decode()` is what
+      `outequipac.py`'s `_on_bytes()` actually calls on every real BLE
+      notification; it does its own frame-boundary math rather than
+      sharing `Frame.decode()`'s. It had `total_len = 3 + length + 2`,
+      double-counting the postamble the same way the old `encode()`/
+      `decode()` did. Fixed to `total_len = 3 + length`. Verified by
+      feeding all 252 real frames from the `.log.last` capture through
+      `try_decode()` as a simulated notification stream (one frame's worth
+      of bytes appended at a time, matching how `_on_bytes` receives BLE
+      notifications): 252 extracted, 0 errors, 0 bytes left over. Before
+      this fix, the live driver would have kept working for exactly one
+      frame after any reconnect and then silently broken frame-boundary
+      detection for everything after that (waiting for 2 bytes that never
+      arrive, then eating the start of the next frame's preamble trying to
+      satisfy that wait) -- so this was a real, live-operation-breaking bug
+      independent of the BLE-connection-layer issue above, not just a
+      decode-path issue confined to `ble_scan_test.py`/offline analysis.
   14. **Practical note for reproducing this on a Pixel (and possibly other
       Android 12+ phones):** Developer Options' "Bluetooth HCI snoop log"
       is a 3-way picker here -- `Disabled` / `Enabled (Filtered)` /

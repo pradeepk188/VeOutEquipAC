@@ -189,7 +189,15 @@ def try_decode(buf: bytearray) -> Optional[Frame]:
     if len(buf) < 4:
         return None
     length = buf[2]
-    total_len = 3 + length + 2  # preamble+len byte(3) + (dev+reg+val+chk) + postamble(2)
+    # `length` already counts dev+reg+val+checksum+postamble (confirmed
+    # against real hardware, see Frame.encode()/decode()) -- total frame
+    # size is preamble+len-byte(3) + length, not + a separate postamble(2)
+    # on top of that. The old `3 + length + 2` double-counted the
+    # postamble, causing this to wait for 2 bytes that would never arrive
+    # as part of the current frame and then consume the start of the next
+    # frame's preamble trying to complete it -- this broke real-device
+    # frame parsing for every frame after the first in a buffer.
+    total_len = 3 + length
     if len(buf) < total_len:
         return None
     raw = bytes(buf[:total_len])
