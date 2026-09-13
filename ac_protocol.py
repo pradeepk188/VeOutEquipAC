@@ -111,10 +111,13 @@ class Frame:
         # bytes and adjust `length` accordingly -- the framing already
         # supports variable-length values via the length byte.
         body = bytes([self.device_type, self.register, self.value & 0xFF])
-        length = len(body) + 1  # +1 for the checksum byte itself is NOT
-        # included per the spec ("Length: bytes remaining in this packet"
-        # counts dev+reg+val+checksum = 4). Keep explicit rather than clever:
-        length = len(body) + 1
+        # Length byte = bytes remaining in this packet AFTER the length byte
+        # itself: dev+reg+val+checksum+postamble. Confirmed against a real
+        # OutEquipPro-app<->AC BLE capture (2026-09-13, Pixel 9 Pro XL HCI
+        # snoop log): a 1-byte-value frame carries length=0x06 (dev(1)+
+        # reg(1)+val(1)+chk(1)+postamble(2)=6), not 4 -- an earlier version
+        # of this code miscounted and only included dev+reg+val+checksum.
+        length = len(body) + 1 + len(POSTAMBLE)
         header = PREAMBLE + bytes([length])
         payload = header + body
         checksum = sum(payload) & 0xFF
@@ -129,9 +132,13 @@ class Frame:
         length = raw[2]
         dev_type = raw[3]
         reg = raw[4]
-        # value occupies bytes [5 : 5+value_len) where value_len = length - 3
-        # (dev+reg+chk = 3 non-value bytes counted in the length byte)
-        value_len = length - 3
+        # value occupies bytes [5 : 5+value_len) where
+        # value_len = length - 5 (dev+reg+chk+postamble = 5 non-value bytes
+        # counted in the length byte -- confirmed against real hardware
+        # capture, see encode() above; a prior version of this code used
+        # length - 3, which omitted the 2-byte postamble and broke on every
+        # real frame with "bad postamble").
+        value_len = length - 5
         if value_len < 1:
             raise FrameError(f"implausible length byte {length} in {raw!r}")
         value_bytes = raw[5:5 + value_len]

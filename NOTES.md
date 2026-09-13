@@ -70,6 +70,249 @@ paths -- turning your AC on/off/heat unattended).
   firmware (no AC-specific code needed on the ESP32 itself) as a relay
   between the AC and the Pi is a proven fallback architecture, not a
   hypothetical one -- see `bobbaboui/outequip-ha`'s `proxy.yaml`.
+- **Root cause of connection failures on the Pi found (2026-09): a
+  post-connection link-layer procedure fails against this AC module on the
+  Pi's onboard Bluetooth controller -- not a competing Venus service.**
+  First captured with `btmon -w` during a plain `bluetoothctl connect
+  <MAC>` against the confirmed unit (`E6:87:25:EC:B3:84`,
+  `KT2026050001550`) on a Raspberry Pi's onboard controller
+  (Cypress/Broadcom chip, single `hci0`). Initial read of that capture
+  wrongly blamed `vesmart_server` (Venus's VE.Smart Networking service)
+  colliding on the radio via `MGMT Command: Add Advertising` around the
+  same time -- **that was coincidental noise, not the cause.** Ruled out by
+  directly testing, in order, with each stopped (`svc -d
+  /service/<name>`) and the connection still failing identically every
+  time: `vesmart-server`, `bluetoothd`'s own self-advertising/discoverable
+  state (confirmed via `bluetoothctl show`: `Discoverable: no`, `Pairable:
+  no`, `ActiveInstances: 0x00`), and `dbus-ble-sensors`. A second `btmon`
+  capture with all of those stopped -- zero other HCI/mgmt activity on the
+  adapter at all -- reproduced the exact same failure with nothing else
+  touching the radio:
+  ```
+  LE Create Connection sent
+  Command Status: Success
+  LE Connection Complete: Status Success        <- connected
+  LE Read Remote Used Features sent (automatic, kernel/BlueZ-initiated
+    on every new LE connection, not something this driver controls)
+  ~140ms later: LE Meta Event "LE Read Remote Used Features" completes
+    with Status: Connection Failed to be Established (0x3e)
+  Disconnect Complete: Reason: Connection Failed to be Established (0x3e)
+  ```
+  At the application layer this shows up as `bluetoothctl connect`
+  reporting `Connected: yes` immediately followed by `Failed to connect:
+  org.bluez.Error.Failed le-connection-abort-by-local` -- `-abort-by-local`
+  confirms the local host tore it down, not the AC actively rejecting.
+  Both `btmon` captures (with and without other services active) show the
+  identical `LE Read Remote Used Features -> 0x3e` event as the actual
+  failure point -- the AC's BLE module isn't completing that link-layer
+  feature-exchange procedure properly, and the Pi's onboard controller
+  firmware kills the connection as a result, ~140ms after "connecting",
+  before this driver's code (or even `ble_scan_test.py`'s Active-register
+  handshake) ever gets a chance to send anything. This is a firmware/
+  link-layer incompatibility between this AC module and the RPi's onboard
+  BT chip, not something fixable in `ac_protocol.py`/`ble_client.py`.
+  **Next thing to try:** a cheap external USB Bluetooth 4.0/5.0 dongle
+  (shows up as `hci1`) in place of the onboard adapter. If that connects
+  cleanly, it confirms the onboard Cypress/Broadcom chip's BLE firmware as
+  the culprit and gives a real fix (use `hci1` for this driver going
+  forward -- `ble_client.py`/`bluepy` needs to target that adapter
+  explicitly). If a different adapter fails the same way, that points at
+  the AC module's own BLE firmware not handling the feature-exchange
+  procedure correctly regardless of host, and the ESP32-S3 Bluetooth-proxy
+  fallback described above becomes the path forward instead of continued
+  direct-host debugging.
+  **Also ruled out (2026-09-13):** `/etc/bluetooth/ble.conf` (the config
+  file Venus launches `bluetoothd` with -- `bluetoothd -E -f
+  /etc/bluetooth/ble.conf`, confirmed via `ps`; there is no
+  `/etc/bluetooth/main.conf` on this device, the default BlueZ looks for --
+  Venus overrides the path) had `Privacy = device` active, enabling LE
+  Privacy (rotating resolvable private address for the local/central side).
+  Commented it out, rebooted (bluetoothd isn't under a runit `/service/`
+  entry on this device, so a full reboot was the reliable way to force a
+  config reload -- confirmed via `ps w | grep bluetoothd` showing the same
+  `-f /etc/bluetooth/ble.conf` invocation post-reboot), confirmed via
+  `bluetoothctl`'s `hci0 new_settings:` line no longer listing `privacy`.
+  Retried the connection: identical failure
+  (`le-connection-abort-by-local`). LE Privacy is not the cause either.
+  USB-dongle test (above) is still the next concrete step on the host-side
+  investigation; not done yet as of this note -- paused to instead capture
+  the real app's traffic (below), which independently confirms the AC
+  module itself holds a stable connection fine, strengthening the case that
+  this is specific to the Pi's onboard controller.
+
+- **Sniffing the real OutEquipPro Android app's BLE traffic against the AC
+  (in progress, 2026-09-13) -- confirms the AC holds a connection fine from
+  a phone; wire-format decoding blocked on Android's HCI log redaction, fix
+  identified but not yet re-captured.** Goal: get real protocol payload
+  bytes from a working session to check against `ac_protocol.py`'s assumed
+  frame format, since the Pi can't sustain a connection at all (above).
+  Method and exact repro, so this doesn't need re-deriving:
+  1. Phone: Developer Options -> "Bluetooth HCI snoop log" -- this device
+     has a **3-way picker**: `Disabled` / `Enabled (Filtered)` / `Enabled`
+     (not a simple on/off toggle -- don't assume it is on other phones).
+     `Enabled (Filtered)` is Android's privacy-redacted mode and is *not*
+     what we want.
+  2. Phone connected via USB, `adb devices` from
+     `tools/platform-tools-latest-windows/platform-tools/adb.exe` (already
+     in this repo's dev tools, gitignored) to confirm it's authorized.
+     Note: adb drops the device from `devices` if the phone's screen
+     locks/USB debugging re-prompts -- re-check `adb devices` if a
+     subsequent command reports "no devices/emulators found".
+  3. Used the OutEquipPro app normally against the confirmed AC
+     (`E6:87:25:EC:B3:84`): connect, power on, change fan speed/mode,
+     power off, disconnect. AC visibly responded to all of it -- this
+     session's phone-to-AC BLE connection is solid proof the AC module
+     itself isn't the problem; whatever's failing on the Pi is specific to
+     the Pi's host/controller.
+  4. Pulled the log via `adb bugreport bugreport_outequip.zip` (reliable,
+     no root needed) -- the Bluetooth HCI snoop log is at
+     `FS/data/misc/bluetooth/logs/btsnooz_hci.log` inside that zip.
+     Despite the `btsnooz` filename (Android's *compressed* format used
+     elsewhere), extracting it directly (`unzip -p bugreport_outequip.zip
+     FS/data/misc/bluetooth/logs/btsnooz_hci.log > btsnooz_hci.log`) gave a
+     file starting with the literal `btsnoop\0` magic header -- i.e. it's
+     already standard uncompressed btsnoop format on this device/Android
+     version, no `btsnooz.py`-style conversion needed. Just copy/rename to
+     a `.btsnoop` extension and it opens directly.
+  5. Analyzed with `tshark` (Wireshark CLI, found at `C:\Program
+     Files\Wireshark\tshark.exe` on this Windows dev machine -- not on
+     PATH, must use the full path). `tshark -r <file>.btsnoop -q -z
+     io,phs` gives a protocol hierarchy summary; filtering
+     `bthci_evt.code == 0x3e` (LE Meta) for connection-complete subevents
+     and reading `bthci_evt.bd_addr`/`bthci_evt.connection_handle` finds
+     which HCI connection handle is the AC's (was `0x0041` in this
+     capture, spanning frames ~340-1200, roughly t=11.9s-54.4s, exactly
+     one connect and one disconnect -- confirmed no reconnects by checking
+     every `bthci_evt.code == 0x05` Disconnect Complete in the whole
+     file). Filtering `bthci_acl.chandle == 0x0041 && btatt` then shows
+     the actual GATT traffic: write characteristic value-handle `0x0010`,
+     notify value-handle `0x0012` (both showed as `(Unknown)` to
+     Wireshark's GATT dissector, expected for FFE1/FFE2-style vendor
+     16-bit UUIDs that aren't in the SIG database -- consistent with, not
+     contradicting, the already-confirmed FFE0/FFE1/FFE2 GATT layout).
+  6. **Initial read looked alarming: every write and notification payload
+     on that connection was only 3 bytes (`5A 5A <byte>`), constant `5A 5A
+     06` on every single write (109 of them) regardless of what button was
+     pressed in the app, with the notify side occasionally blipping to
+     `07`/`08`.** This looked like it might mean the real BLE wire format
+     for this OutEquip-branded module is a minimal 3-byte frame, nothing
+     like `ac_protocol.py`'s assumed 9-byte
+     `5A 5A LEN DEV REG VAL CHK 0D 0A` framing (which makes some sense on
+     its face -- BLE's ATT/L2CAP layer already delimits and CRCs each
+     packet, so a UART-style length/checksum/postamble that
+     `protocol.md`'s wired-UART framing needs would be redundant, and the
+     BLE variant of the same logical protocol could legitimately be
+     shorter). **This turned out to be wrong** -- see next point --
+     flagging it here only because it's a plausible-looking dead end worth
+     not re-deriving/re-falling-for.
+  7. **Root cause of the too-short payloads: Android's HCI snoop log
+     truncates/redacts GATT payload bytes even in the plain `Enabled`
+     mode on this device, not just `Enabled (Filtered)`.** Proved via
+     `tshark -T fields -e frame.len -e frame.cap_len`: e.g. frame 487 had
+     `frame.len` (real/original packet length) of 21 bytes but
+     `frame.cap_len` (what was actually logged) of only 15 -- 6 bytes
+     silently cut. Working back from the L2CAP declared payload length (12
+     bytes = 1-byte ATT opcode + 2-byte handle + **9-byte value**), the
+     real write value is 9 bytes -- which matches `ac_protocol.py`'s
+     assumed frame format exactly. The "constant 3-byte heartbeat" was
+     just the unredacted first 3 bytes of every real (longer, presumably
+     varying) frame; everything after byte 3 was zeroed/stripped by the
+     phone's own OS before it ever reached the log file. This is why the
+     write payload never appeared to change even though the AC visibly
+     responded to real button presses -- the actual command bytes were
+     there on the wire, just not in what got logged.
+  8. Tried to force full/unredacted logging via
+     `adb shell setprop persist.bluetooth.btsnooplogmode full` --
+     **failed, "Failed to set property... See dmesg for error reason"**
+     (this needs root; this phone is unrooted). `adb shell settings get
+     secure bluetooth_hci_log` also returned `null` (not the right
+     setting key on this Android version either).
+  9. Re-selecting plain `Enabled` (it was already selected, but a
+     Bluetooth off/on toggle was needed to actually apply it -- the prior
+     capture's truncation was stale state, not `Enabled` itself being
+     redacted) plus setting the separate, unrelated "Bluetooth" log
+     *verbosity* picker (Info/Debug/Warn/Error/Verbose -- a different
+     Developer Options entry, general Bluetooth-stack logging, nothing to
+     do with HCI snoop redaction) to `Verbose` for good measure, then
+     redoing the app interaction, fixed it: the fresh `adb bugreport`'s
+     `FS/data/misc/bluetooth/logs/btsnoop_hci.log` (note: genuinely named
+     `btsnoop_hci.log` this time, not `btsnooz_hci.log` -- another sign the
+     unredacted mode was active) showed **zero** `frame.len` !=
+     `frame.cap_len` mismatches across all 1997 frames.
+  10. **Bug found and fixed in `ac_protocol.py`'s `Frame.encode()`/
+      `decode()`: the length-byte math was wrong, off by the 2-byte
+      postamble.** Decoding the real captured frames through the actual
+      `Frame.decode()` (not a reimplementation -- this matters, see
+      CLAUDE.md's note about `ble_scan_test.py` sharing the real codec for
+      the same reason) failed on **every single real frame** with `bad
+      postamble` -- e.g. a real 1-byte-value frame
+      `5a 5a 06 01 12 00 cd 0d 0a` has length byte `0x06`, but the old code
+      computed `value_len = length - 3` (assuming length counts only
+      dev+reg+val+checksum), consuming the checksum and half the postamble
+      as if they were value bytes. Confirmed from two independent frame
+      shapes in the capture (a 1-byte-value frame with length=0x06, a
+      2-byte-value voltage-register frame with length=0x07) that length
+      actually counts dev+reg+val+checksum+**postamble** = value_len+5, not
+      value_len+3. Fixed: `decode()` now uses `value_len = length - 5`;
+      `encode()` now computes `length = len(body) + 1 + len(POSTAMBLE)`
+      instead of `len(body) + 1`. This means **every frame this driver has
+      ever sent to real hardware had a wrong length byte** (4 instead of 6
+      for the common 1-byte-value case) -- worth keeping in mind if any
+      past on-device testing behaved strangely; the AC's firmware may have
+      been silently misparsing or ignoring malformed writes rather than the
+      BLE layer being at fault.
+  11. **Full validation after the fix, against the *previous* (rotated-out)
+      BLE session in the same bugreport.** Android keeps one rotated-out
+      prior snoop log alongside the current one:
+      `FS/data/misc/bluetooth/logs/btsnoop_hci.log.last` in the same zip.
+      The *current* log's captured AC session (`chandle 0x0041`,
+      ~162-176s relative) turned out to be a later, idle reconnect that
+      only ever polled (42 write/42 notify frames, every write value=0 --
+      i.e. pure reads, no real commands) -- worth remembering if a future
+      capture looks like "nothing but polling," check `.log.last` too
+      before concluding the app isn't sending real commands. The *real*
+      interaction session was in `.log.last` (`chandle 0x0041` again,
+      ~764-806s relative, 252 write/notify frames, clean disconnect at the
+      end this time). **All 252 frames decoded with zero errors** through
+      the fixed `Frame.decode()`, and the actual command frames matched
+      the real button presses exactly:
+      `POWER=2` (power on) -> `SETPOINT=67,68,69` (three temperature taps)
+      -> `FAN_SPEED=2` (fan speed change) -> `POWER=1` (power off).
+      `ON_OFF_ON = 2` / `ON_OFF_OFF = 1` in `ac_protocol.py` match exactly.
+      This confirms the frame format, checksum algorithm (`sum(payload) &
+      0xFF` over preamble+length+dev+reg+value, matching `encode()`
+      exactly), `DEVICE_TYPE_AC = 0x01`, and the whole `REG_*` map end to
+      end against real hardware, not just circumstantially from two other
+      reverse-engineering projects.
+  12. **New/undocumented registers seen in the real app's idle poll cycle**
+      (not in `ac_protocol.py`'s `REG_*` map -- meanings unknown, noting
+      the raw numbers in case they matter later): register `9` (seen
+      value `1`), register `11` (value `0`), register `22` (value `3`),
+      and register `26` queried but the *reply* came back tagged as
+      register `27` (value `0`) -- consistent with the documented
+      "mismatched response reflects the last-queried register" firmware
+      quirk applying even to plain reads, not just writes.
+  13. **Register 66 (`REG_ACTIVE`) never appeared in either real captured
+      app session.** The real OutEquipPro app did not query it before, or
+      at any point during, ~14s and ~42s of normal use on this unit. This
+      contradicts the `protocol.md`-sourced assumption (recorded earlier
+      in this file) that the app always does the Active-handshake first.
+      Not removing `outequipac.py`'s `_do_active_handshake()` over this
+      alone -- it may still be harmless/a no-op, or may matter for a fresh
+      (never-before-paired) connection specifically, which this phone's
+      session wasn't -- but flagging the discrepancy rather than treating
+      the handshake as confirmed-necessary.
+  14. **Practical note for reproducing this on a Pixel (and possibly other
+      Android 12+ phones):** Developer Options' "Bluetooth HCI snoop log"
+      is a 3-way picker here -- `Disabled` / `Enabled (Filtered)` /
+      `Enabled` -- not a simple toggle; don't assume otherwise on a
+      different phone. `Enabled (Filtered)` is the redacted mode and
+      useless for protocol reverse-engineering. Setting `Enabled` requires
+      a Bluetooth off/on toggle to actually take effect, not just
+      reselecting it in the menu. `adb shell setprop
+      persist.bluetooth.btsnooplogmode full` does **not** work on an
+      unrooted phone ("Failed to set property... See dmesg", needs root) --
+      don't bother trying it again, use the in-menu picker instead.
 - **Initialization handshake required.** Re-reading `protocol.md`'s
   Initialization section directly (rather than from memory) turned up a
   step neither `ble_client.py` nor the original `ble_scan_test.py` did: the
